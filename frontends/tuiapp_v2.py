@@ -3746,7 +3746,7 @@ class GenericAgentTUI(App[None]):
             primary=p["green"], secondary=p["blue"], accent=p["purple"],
         ))
         saved = _load_settings().get("theme")
-        self.theme = saved if saved in _THEME_CYCLE else "ga-default"
+        self.theme = saved if saved in _THEME_CYCLE else "textual-light"
         self._spinner_frame: int = 0
         self._spinner_timer = None
         self._handlers: dict = {
@@ -4566,7 +4566,7 @@ class GenericAgentTUI(App[None]):
     def action_pick_theme(self) -> None:
         if isinstance(self.screen, ThemePicker):
             return
-        self.push_screen(ThemePicker(list(_THEME_CYCLE), self.theme or "ga-default"))
+        self.push_screen(ThemePicker(list(_THEME_CYCLE), self.theme or "textual-light"))
 
     def _resolve_palette(self) -> dict[str, str]:
         theme = self.current_theme
@@ -4599,7 +4599,7 @@ class GenericAgentTUI(App[None]):
         C_CHIP_EFFORT = _palette["chip_effort"]
         C_CHIP_TASKS  = _palette["chip_tasks"]
         C_CHIP_TIME   = _palette["chip_time"]
-        # watch_theme fires once during __init__ when we set ga-default — at that
+        # watch_theme fires once during __init__ when we set the initial theme — at that
         # point sessions is empty and the DOM isn't composed yet. Skip the rebuild.
         if not self.is_mounted or self.current_id is None:
             return
