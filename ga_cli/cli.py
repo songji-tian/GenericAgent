@@ -24,6 +24,10 @@ def launch_frontend(cmd_parts, args=None):
     """启动前端/工具进程"""
     full_cmd = []
     for part in cmd_parts:
+        # Reuse the interpreter running this CLI. `python` may not exist on
+        # macOS/Linux, and this also keeps child frontends inside the venv.
+        if part == "python":
+            part = sys.executable
         part = part.replace("{PROJECT_DIR}", PROJECT_DIR)
         part = part.replace("{FRONTENDS}", _frontends())
         part = part.replace("{REFLECT}", _reflect())
@@ -61,9 +65,9 @@ COMMANDS = {
         "cmd": ["python", "{PROJECT_DIR}/hub.pyw"],
     },
     "tui": {
-        "help": "启动终端 TUI (tuiapp)",
-        "desc": "启动终端图形界面（Textual），适合纯终端环境或 SSH",
-        "cmd": ["python", "{FRONTENDS}/tuiapp.py"],
+        "help": "启动终端 TUI (tuiapp_v2)",
+        "desc": "启动支持主题切换的终端图形界面，适合纯终端环境或 SSH",
+        "cmd": ["python", "{FRONTENDS}/tuiapp_v2.py"],
     },
     "tui2": {
         "help": "启动终端 TUI v2 (tuiapp_v2)",
