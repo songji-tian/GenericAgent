@@ -72,7 +72,13 @@ class GenericAgent:
         for k, cfg in mykeys.items():
             if not any(x in k for x in ['api', 'config', 'cookie']): continue
             try:
-                if 'mixin' in k: llm_sessions += [{'mixin_cfg': cfg}]
+                if 'mixin' in k:
+                    # An empty mixin is a template placeholder, not a usable
+                    # model. Keeping it creates a BADCONFIG_MIXIN entry that
+                    # can become the default ahead of valid configured models.
+                    if not isinstance(cfg, dict) or not cfg.get('llm_nos'):
+                        continue
+                    llm_sessions += [{'mixin_cfg': cfg}]
                 elif c := resolve_client(k): llm_sessions += [c]
             except: pass
         for i, s in enumerate(llm_sessions):
