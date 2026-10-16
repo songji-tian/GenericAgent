@@ -673,7 +673,9 @@ class BaseSession:
         mode = str(cfg.get('api_mode', 'chat_completions')).strip().lower().replace('-', '_')
         self.api_mode = 'responses' if mode in ('responses', 'response') else 'chat_completions'
         self.temperature = cfg.get('temperature', 1)
-        self.max_tokens = cfg.get('max_tokens')
+        # DeepSeek caps output at 384K but silently falls back to 8K/64K/128K
+        # when max_tokens is absent, truncating long answers mid-sentence.
+        self.max_tokens = cfg.get('max_tokens') or (393216 if 'deepseek' in self.model.lower() else None)
         self.default_ua = "claude-cli/2.1.280 (external, cli)"
         self.user_agent = cfg.get("user_agent", self.default_ua)
     def _apply_claude_thinking(self, payload):
