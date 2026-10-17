@@ -477,11 +477,14 @@ class GenericAgentHandler(BaseHandler):
             return self._retry_or_exit("[ERROR] Blank response, regenerate and tooluse")
         if '[!!! 流异常中断' in content[-100:] or '!!!Error:' in content[50:][-100:] or (content.endswith('</summary>') and len(content) < 100):
             return self._retry_or_exit("[ERROR] Incomplete response. Regenerate and tooluse.")
-        tail = content.rstrip()[-200:]
-        if 'DSML' in tail and (re.search(r'</[^>]*>\s*$', content.rstrip()) or ('｜' in tail and tail.rstrip().endswith('>'))):
+        if content.rstrip().endswith('</｜DSML｜ calls>'):
             return self._retry_or_exit("[ERROR] Tool call format invalid; no tool was called. Regenerate using proper tool calls.")
         if 'max_tokens !!!]' in content[-100:]:
             return self._retry_or_exit("[ERROR] max_tokens limit reached. Use multi small steps to do it.")
+        if getattr(response, 'dsml_leak', False) or re.search(r'</?[|｜‖]{1,2}DSML', content[-200:]):
+            # 模型把工具调用写成了 DSML 标记文本(多种变体/跨 chunk 泄漏)，本回合其实没真正调用工具
+            yield "[Warn] DSML tool-call markup leaked into content, no real tool call. Retrying...\n"
+            return self._retry_or_exit("[ERROR] Your tool call leaked as raw DSML markup text instead of a real tool call. Regenerate this turn and call the tool normally.")
         
         # 模型把工具调用写成了文本 XML（完整 <code_run>…</code_run> 或截断的 <code_run">），
         # 本回合其实没有 tool_call（#837 复发）。完整的已由 agent_runner_loop 自动执行，
@@ -492,8 +495,20 @@ class GenericAgentHandler(BaseHandler):
         except Exception:
             _calls, _partial = [], False
         if _calls:
-            yield "[Warn] 检测到文本通道的工具调用，已自动执行。\n"
-            return StepOutcome(None, next_prompt="工具已执行，继续任务。")
+            # 真的执行，而不是只喊一句"已执行"（这里只有 agent_loop 没接住时才会走到）
+            yield "[Warn] 检测到文本通道的工具调用，转为真实调用执行。\n"
+            for _i, (_n, _a) in enumerate(_calls):
+                try:
+                    _g = self.dispatch(_n, _a, response, index=_i, tool_num=len(_calls))
+                    try:
+                        while True: next(_g)
+                    except StopIteration as _e:
+                        _o = getattr(_e, "value", None)
+                        if getattr(_o, "should_exit", False): return _o
+                except Exception as _err:
+                    yield f"[Warn] 文本通道调用 {_n} 执行失败: {_err}\n"
+                    return self._retry_or_exit("[ERROR] Text-channel tool call failed to execute. Regenerate using a real tool call.")
+            return StepOutcome(None, next_prompt="文本通道的工具调用已执行，请基于结果继续任务。")
         if _partial:
             yield "[Warn] 工具调用被写成未闭合的文本标记，重试一次。\n"
             return self._retry_or_exit("[ERROR] Your tool call was emitted as truncated markup text (e.g. <code_run\">) instead of a real tool call. Regenerate this turn and call the tool normally.")
