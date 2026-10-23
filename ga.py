@@ -302,11 +302,12 @@ class GenericAgentHandler(BaseHandler):
 
     def do_code_run(self, args, response):
         '''执行代码片段，有长度限制，不允许代码中放大量数据，如有需要应当通过文件读取进行。'''
-        code_type = args.get("type", "python")
+        code_type = args.get("type") or "python"
         code = args.get("code") or args.get("script")
         if not code:
             code = self._extract_code_block(response, code_type)
             if not code: return StepOutcome("[Error] Code missing. Must use reply code block or 'script' arg.", next_prompt="\n")
+        if not args.get("type") and re.match(r"^\s*(ls|cd|pwd|dir|echo|cat|git|pip|npm|curl|ssh)(\s|$)", code): code_type = "shell"
         timeout = _arg(args, "timeout", 60, int)
         raw_path = os.path.join(self.cwd, args.get("cwd", './'))
         cwd = os.path.normpath(os.path.abspath(raw_path))
@@ -352,7 +353,8 @@ class GenericAgentHandler(BaseHandler):
     def do_web_execute_js(self, args, response):
         '''web情况下的优先使用工具，执行任何js达成对浏览器的*完全*控制。支持将结果保存到文件供后续读取分析。'''
         script = args.get("script", "") or self._extract_code_block(response, "javascript")
-        if not script: return StepOutcome("[Error] Script missing. Use ```javascript block or 'script' arg.", next_prompt="\n")
+        if not isinstance(script, str): script = json.dumps(script, ensure_ascii=False, default=json_default) if isinstance(script, (dict, list)) else str(script)
+        if not script or not script.strip(): return StepOutcome("[Error] Script missing. Use ```javascript block or 'script' arg.", next_prompt="\n")
         abs_path = self._get_abs_path(script.strip())
         if os.path.isfile(abs_path):
             with open(abs_path, 'r', encoding='utf-8') as f: script = f.read()
@@ -447,16 +449,6 @@ class GenericAgentHandler(BaseHandler):
     def export_history(self, fn):
         with open(fn, 'w', encoding='utf-8') as f: json.dump(self.parent.llmclient.backend.history, f, ensure_ascii=False)
     def enter_project_mode(self, name): self.parent._ga_project_mode_name = name
-    def _in_plan_mode(self): return self.working.get('in_plan_mode')
-    def _exit_plan_mode(self): self.working.pop('in_plan_mode', None)
-    def enter_plan_mode(self, plan_path): 
-        self.working['in_plan_mode'] = plan_path; self.max_turns = 100
-        self.print(f"[Info] Entered plan mode with plan file: {plan_path}")
-        return plan_path
-    def _check_plan_completion(self):
-        if not os.path.isfile(p:=self._in_plan_mode() or ''): return None
-        try: return len(re.findall(r'\[ \]', open(p, encoding='utf-8', errors='replace').read()))
-        except: return None
     
     def do_update_working_checkpoint(self, args, response):
         '''为整个任务设定后续需要临时记忆的重点。'''
@@ -485,10 +477,41 @@ class GenericAgentHandler(BaseHandler):
             return self._retry_or_exit("[ERROR] Blank response, regenerate and tooluse")
         if '[!!! 流异常中断' in content[-100:] or '!!!Error:' in content[50:][-100:] or (content.endswith('</summary>') and len(content) < 100):
             return self._retry_or_exit("[ERROR] Incomplete response. Regenerate and tooluse.")
-        if 'DSML' in content[-200:] and re.search(r'</[^>]*>\s*$', content.rstrip()):
+        if content.rstrip().endswith('</｜DSML｜ calls>'):
             return self._retry_or_exit("[ERROR] Tool call format invalid; no tool was called. Regenerate using proper tool calls.")
         if 'max_tokens !!!]' in content[-100:]:
             return self._retry_or_exit("[ERROR] max_tokens limit reached. Use multi small steps to do it.")
+        if getattr(response, 'dsml_leak', False) or re.search(r'</?[|｜‖]{1,2}DSML', content[-200:]):
+            # 模型把工具调用写成了 DSML 标记文本(多种变体/跨 chunk 泄漏)，本回合其实没真正调用工具
+            yield "[Warn] DSML tool-call markup leaked into content, no real tool call. Retrying...\n"
+            return self._retry_or_exit("[ERROR] Your tool call leaked as raw DSML markup text instead of a real tool call. Regenerate this turn and call the tool normally.")
+        
+        # 模型把工具调用写成了文本 XML（完整 <code_run>…</code_run> 或截断的 <code_run">），
+        # 本回合其实没有 tool_call（#837 复发）。完整的已由 agent_runner_loop 自动执行，
+        # 这里兜住其它调用路径；截断的必须重试，否则整轮直接"停"。
+        try:
+            from llmcore import split_text_tool_calls
+            _calls, _partial = split_text_tool_calls(content, {n[3:] for n in dir(self) if n.startswith('do_')})
+        except Exception:
+            _calls, _partial = [], False
+        if _calls:
+            # 真的执行，而不是只喊一句"已执行"（这里只有 agent_loop 没接住时才会走到）
+            yield "[Warn] 检测到文本通道的工具调用，转为真实调用执行。\n"
+            for _i, (_n, _a) in enumerate(_calls):
+                try:
+                    _g = self.dispatch(_n, _a, response, index=_i, tool_num=len(_calls))
+                    try:
+                        while True: next(_g)
+                    except StopIteration as _e:
+                        _o = getattr(_e, "value", None)
+                        if getattr(_o, "should_exit", False): return _o
+                except Exception as _err:
+                    yield f"[Warn] 文本通道调用 {_n} 执行失败: {_err}\n"
+                    return self._retry_or_exit("[ERROR] Text-channel tool call failed to execute. Regenerate using a real tool call.")
+            return StepOutcome(None, next_prompt="文本通道的工具调用已执行，请基于结果继续任务。")
+        if _partial:
+            yield "[Warn] 工具调用被写成未闭合的文本标记，重试一次。\n"
+            return self._retry_or_exit("[ERROR] Your tool call was emitted as truncated markup text (e.g. <code_run\">) instead of a real tool call. Regenerate this turn and call the tool normally.")
         
         if self._in_plan_mode() and any(kw in content for kw in ['任务完成', '全部完成', '已完成所有', '🏁']):
             if 'VERDICT' not in content and '[VERIFY]' not in content and '验证subagent' not in content:
@@ -517,12 +540,6 @@ class GenericAgentHandler(BaseHandler):
                         "并明确是否还需要额外的实际操作。"
                     )
                     return StepOutcome({}, next_prompt=next_prompt)
-                
-        if self._in_plan_mode():
-            remaining = self._check_plan_completion()
-            if remaining == 0:
-                self._exit_plan_mode(); yield "[Info] Plan完成：plan.md中0个[ ]残留，退出plan模式。\n"
-        
         #yield "[Info] Final response to user.\n"
         return StepOutcome(response, next_prompt=None)
     
@@ -536,6 +553,7 @@ class GenericAgentHandler(BaseHandler):
         path = './memory/memory_management_sop.md'
         if os.path.exists(path): result = 'This is L0:\n' + file_read(path, show_linenos=False)
         else: result = "Memory Management SOP not found. Do not update memory."
+        if (l1 := load_L1()) and len(l1) > 6000: result += 'L1 (insight or index) is too large, follow L0 and cleanup sop to fix it!'
         if self.current_turn < 10: result, prompt = 'start_long_term_update is only used after completing a long turn task!', '\n'
         return StepOutcome(result, next_prompt=prompt)
 
@@ -574,19 +592,14 @@ class GenericAgentHandler(BaseHandler):
             self.history_info.append('[Agent] ' + summary)
         if not rsumm and tool_calls and tool_calls[0]['tool_name'] != 'no_tool':
             next_prompt += "\n\n\n[TIPS] 必须在回复文本中包含<summary>！\n\n"
-        _plan = self._in_plan_mode()
 
-        if turn % 175 == 0 and (not _plan):
+        if turn % 175 == 0:
             next_prompt += f"\n\n[DANGER] Turn {turn}. Must call ask_user to summarize progress and get direction. No more blind retries."
-        elif turn % 13 == 0:
+        elif turn % 17 == 0:
             next_prompt += f"\n\n[DANGER] Turn {turn}. Call update_working_checkpoint to save key context. Stop ineffective retries; if no progress, switch strategy: 1) Probe physical boundaries 2) **Re-read relevant SOPs**"
-        elif turn % 31 == 0:
+        elif turn % 41 == 0:
             next_prompt += f"\n\n[DANGER] Turn {turn}. Write checkpoints/key findings/tried approaches to a **file** for future reference (not only working_checkpoint!). Avoid losing critical info."
-        elif turn % 10 == 0: next_prompt += f'<global_memory>{get_global_memory()}</global_memory>'
-
-        if _plan and turn >= 10 and turn % 5 == 0:
-            next_prompt = f"[Plan Hint] 正在计划模式。必须 file_read({_plan}) 确认当前步骤，回复开头引用：📌 当前步骤：...\n\n" + next_prompt
-        if _plan and turn >= 190: next_prompt += f"\n\n[DANGER] Plan模式已运行 {turn} 轮，已达上限。必须 ask_user 汇报进度并确认是否继续。"
+        elif turn % 15 == 0: next_prompt += f'<global_memory>{get_global_memory()}</global_memory>'
 
         injkeyinfo = self.parent.extrakeyinfo or consume_file(self.parent.task_dir, '_keyinfo')
         injprompt = self.parent.intervene or consume_file(self.parent.task_dir, '_intervene')
@@ -596,11 +609,17 @@ class GenericAgentHandler(BaseHandler):
         for hook in list(getattr(self.parent, '_turn_end_hooks', {}).values()): hook(locals())  # current readonly
         return next_prompt
 
+def load_L1():
+    try:
+        with open(os.path.join(script_dir, 'memory/global_mem_insight.txt'), 'r', encoding='utf-8', errors='replace') as f: content = f.read()
+        return content
+    except FileNotFoundError: return ''
+
 def get_global_memory():
     prompt = "\n"
     try:
         suffix = '_en' if os.environ.get('GA_LANG', '') == 'en' else ''
-        with open(os.path.join(script_dir, 'memory/global_mem_insight.txt'), 'r', encoding='utf-8', errors='replace') as f: insight = f.read()
+        insight = load_L1()
         with open(os.path.join(script_dir, f'assets/insight_fixed_structure{suffix}.txt'), 'r', encoding='utf-8') as f: structure = f.read()
         prompt += f'cwd = {os.path.join(script_dir, "temp")} (./)\n'
         prompt += f"\n[Memory] (../memory)\n"
