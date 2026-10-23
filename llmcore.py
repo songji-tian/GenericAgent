@@ -1067,7 +1067,7 @@ class NativeClaudeSession(BaseSession):
         text_parts = [b["text"] for b in content_blocks if b.get("type") == "text"]
         content = "\n".join(text_parts).strip()
         tool_calls = [MockToolCall(b["name"], b.get("input", {}), id=b.get("id", "")) for b in content_blocks if b.get("type") == "tool_use"]
-        if not tool_calls: tool_calls, content = _parse_text_tool_calls(content)
+        if not tool_calls: tool_calls, content = _parse_text_tool_calls(content, _extract_tool_names(self.tools))
         thinking_parts = [b["thinking"] for b in content_blocks if b.get("type") == "thinking"]
         thinking = "\n".join(thinking_parts).strip()
         if not thinking:
@@ -1118,12 +1118,14 @@ class ToolClient:
         self.backend = backend
         self.auto_save_tokens = auto_save_tokens
         self.last_tools = ''
+        self.tools = None
         self.name = self.backend.name
         self.total_cd_tokens = 0
         self.log_path = None
 
     def chat(self, messages, tools=None):
         tools = json.loads(json.dumps(tools, ensure_ascii=False)) if tools else tools
+        self.tools = tools
         for t in tools or []:
             f = t.get('function', {})
             if f.get('name') == 'file_write':
@@ -1163,7 +1165,14 @@ Follow these steps to think and act:
 2. **总结**: 在 `<summary>` 中输出*极为简短*的高度概括的单行（<30字）物理快照，包括上次工具调用结果产生的新信息+本次工具调用意图。此内容将进入长期工作记忆，记录关键信息，严禁输出无实际信息增量的描述。
 3. **行动**: 如需调用工具，请在回复正文之后输出一个（或多个）**<tool_use>块**，然后结束。
 """
-        tool_instruction += f'\nFormat: ```<tool_use>{{"name": "tool_name", "arguments": {{...}}}}</tool_use>```\n\n### Tools (mounted, always in effect):\n{tools_json}\n'
+        tool_instruction += f'\nFormat: ```<tool_use>{{"name": "tool_name", "arguments": {{...}}}}</tool_use>```\n'
+        tool_instruction += ('IMPORTANT: The ONLY valid tool-call syntax is the <tool_use> JSON block above. '
+                             'Never write <code_run>, <parameter>, or other XML-style tool tags; '
+                             'they are display-only and are not the supported tool-call protocol.\n'
+                             if _en else
+                             '重要：唯一有效的工具调用格式是上面的 <tool_use> JSON 块；'
+                             '不要写 <code_run>、<parameter> 等 XML 风格标签，它们只是界面展示格式，不是受支持的工具调用协议。\n')
+        tool_instruction += f'\n### Tools (mounted, always in effect):\n{tools_json}\n'
         if self.auto_save_tokens and self.last_tools == tools_json:
             tool_instruction = "\n### Tools: still active, **ready to call**. Protocol unchanged.\n" if _en else "\n### 工具库状态：持续有效（code_run/file_read等），**可正常调用**。调用协议沿用。\n"
         else: self.total_cd_tokens = 0
@@ -1193,7 +1202,7 @@ Follow these steps to think and act:
         if think_match:
             thinking = think_match.group(1).strip()
             remaining_text = re.sub(r"<think(?:ing)?>(.*?)</think(?:ing)?>", "", remaining_text, flags=re.DOTALL)
-        tool_calls, remaining_text = _parse_text_tool_calls(remaining_text)
+        tool_calls, remaining_text = _parse_text_tool_calls(remaining_text, _extract_tool_names(getattr(self, 'tools', None)))
         if not tool_calls:
             json_strs = []; errors = []
             if '<tool_use>' in remaining_text:
@@ -1224,7 +1233,17 @@ Follow these steps to think and act:
                     print(f"[Warn] {e}"); tool_calls.append(MockToolCall('bad_json', {'msg': e}))
         return MockResponse(thinking, remaining_text.strip(), tool_calls, text)
 
-def _parse_text_tool_calls(content):
+def _extract_tool_names(tools):
+    """Return tool names from OpenAI- or Claude-style tool schemas."""
+    names = []
+    for t in tools or []:
+        if not isinstance(t, dict): continue
+        fn = t.get('function') or t
+        n = fn.get('name') if isinstance(fn, dict) else None
+        if isinstance(n, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', n): names.append(n)
+    return list(dict.fromkeys(names))
+
+def _parse_text_tool_calls(content, tool_names=None):
     """Fallback: extract tool calls from text when model doesn't use native tool_use blocks."""
     tcs = []
     # try JSON array: [{"type":"tool_use", "name":..., "input":...}]
@@ -1244,6 +1263,28 @@ def _parse_text_tool_calls(content):
             if name: tcs.append(MockToolCall(name, args))
         except: pass
     if tcs: content = re.sub(_xp, "", content, flags=re.DOTALL).strip()
+
+    # try XML-style tool blocks: <code_run>...<parameter name="script">...</parameter></code_run>
+    # Tolerate display-only variants such as <code_run"> ... </code_run>.
+    names = [n for n in (tool_names or []) if isinstance(n, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', n)]
+    if names:
+        alt = '|'.join(re.escape(n) for n in sorted(set(names), key=len, reverse=True))
+        _block_re = re.compile(rf'<\s*({alt})\b[^>]*>([\s\S]*?)</\s*\1\s*[^>]*>', re.IGNORECASE)
+        _param_re = re.compile(r'<\s*parameter\s+name\s*=\s*(["\']?)([A-Za-z_][\w.-]*)\1\s*>([\s\S]*?)</\s*parameter\s*>', re.IGNORECASE)
+        for m in _block_re.finditer(content):
+            raw_name, body = m.group(1), m.group(2)
+            name = next((n for n in names if n.lower() == raw_name.lower()), raw_name)
+            args = {}
+            for pm in _param_re.finditer(body):
+                val = pm.group(3)
+                if val.startswith('\n'): val = val[1:]
+                if val.endswith('\n'): val = val[:-1]
+                args[pm.group(2)] = val
+            if args:
+                tcs.append(MockToolCall(name, args))
+            elif '```' in body:
+                # Let handlers extract the fenced block from response.content.
+                tcs.append(MockToolCall(name, {}))
     return tcs, content
 
 def _ensure_text_block(blocks):

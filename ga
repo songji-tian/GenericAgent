@@ -1,5 +1,18 @@
 #!/usr/bin/env bash
-cd "$(dirname "$0")"
-PY=.venv/bin/python
-[ -x "$PY" ] || PY=python
+# Resolve symlinks so `~/.local/bin/ga` still runs this checkout, and keep
+# every child `python` on the project venv instead of whatever is first on PATH.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+cd "$ROOT" || exit 1
+if [ -x "$ROOT/.venv/bin/python" ]; then
+  export PATH="$ROOT/.venv/bin:$PATH"
+  PY="$ROOT/.venv/bin/python"
+else
+  PY=python
+fi
 exec "$PY" -m ga_cli "$@"

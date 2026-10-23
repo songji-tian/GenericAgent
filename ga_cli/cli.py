@@ -74,6 +74,11 @@ COMMANDS = {
         "desc": "启动增强版终端图形界面（Textual v2），更多功能更好的体验",
         "cmd": ["python", "{FRONTENDS}/tuiapp_v2.py"],
     },
+    "tui3": {
+        "help": "启动终端 TUI v3 (tui_v3，推荐)",
+        "desc": "启动滚屏回看 TUI。需要真实终端。",
+        "cmd": ["python", "{FRONTENDS}/tui_v3.py"],
+    },
     "cli": {
         "help": "启动 CLI 对话 (agentmain)",
         "desc": "启动命令行交互对话模式，最轻量的使用方式",

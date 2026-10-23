@@ -466,6 +466,40 @@ class GenericAgentHandler(BaseHandler):
         if self._empty_ct >= 3: return StepOutcome({}, should_exit=True)
         return StepOutcome({}, next_prompt=prompt)
 
+    def _current_tool_names(self):
+        try:
+            tools = getattr(self.parent.llmclient.backend, 'tools', None) or []
+        except Exception:
+            tools = []
+        names = []
+        for t in tools:
+            if not isinstance(t, dict): continue
+            fn = t.get('function') or t
+            n = fn.get('name') if isinstance(fn, dict) else None
+            if isinstance(n, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', n): names.append(n)
+        return list(dict.fromkeys(names))
+
+    def _looks_like_unparsed_tool_call(self, content):
+        """Detect XML-style tool tags that were not parsed, including truncated openers."""
+        names = self._current_tool_names() or [
+            'code_run', 'file_read', 'file_write', 'file_patch',
+            'web_scan', 'web_execute_js', 'ask_user',
+            'update_working_checkpoint', 'start_long_term_update',
+        ]
+        alt = '|'.join(re.escape(n) for n in sorted(set(names), key=len, reverse=True))
+        # Ignore closed fenced code examples; a real fenced call is recovered by the parser first.
+        scan = re.sub(r'```[^\n]*\n[\s\S]*?```', '', content)
+        tail = scan.rstrip()
+        # Complete opening tag at the very end: <code_run>, <code_run">, <code_run attr="x">
+        if re.search(rf'(?:^|\n)\s*<\s*(?:{alt})\b[^>]*>\s*$', tail, re.IGNORECASE): return True
+        # Truncated opening tag at the very end: <code_run, <code_run"
+        if re.search(rf'(?:^|\n)\s*<\s*(?:{alt})\b[^>]*$', tail, re.IGNORECASE): return True
+        # Dangling protocol tags
+        if re.search(r'(?:^|\n)\s*<\s*(?:tool_use|tool_call|parameter)\b[^>]*>\s*$', tail, re.IGNORECASE): return True
+        # A full XML-style block that still contains <parameter> (parser missed it)
+        if re.search(rf'(?:^|\n)\s*<\s*(?:{alt})\b[^>]*>[\s\S]*?<\s*parameter\b', scan, re.IGNORECASE): return True
+        return False
+
     def do_no_tool(self, args, response):
         '''这是一个特殊工具，由引擎自主调用，不要包含在TOOLS_SCHEMA里。
         当模型在一轮中未显式调用任何工具时，由引擎自动触发。
@@ -477,6 +511,15 @@ class GenericAgentHandler(BaseHandler):
             return self._retry_or_exit("[ERROR] Blank response, regenerate and tooluse")
         if '[!!! 流异常中断' in content[-100:] or '!!!Error:' in content[50:][-100:] or (content.endswith('</summary>') and len(content) < 100):
             return self._retry_or_exit("[ERROR] Incomplete response. Regenerate and tooluse.")
+        if self._looks_like_unparsed_tool_call(content):
+            yield "[Warn] Detected an incomplete or unparsed tool-call tag; no tool was executed. Requesting a corrected call.\n"
+            try: self.parent.llmclient.last_tools = ''
+            except Exception: pass
+            return self._retry_or_exit(
+                "[ERROR] Your previous reply contained an incomplete or unparsed tool-call tag, so no tool was executed. "
+                "Re-emit the call using exactly: <tool_use>{\"name\": \"tool_name\", \"arguments\": {...}}</tool_use>. "
+                "Never use <code_run>, <parameter>, or other XML-style tags for tool calls."
+            )
         if content.rstrip().endswith('</｜DSML｜ calls>'):
             return self._retry_or_exit("[ERROR] Tool call format invalid; no tool was called. Regenerate using proper tool calls.")
         if 'max_tokens !!!]' in content[-100:]:
@@ -541,6 +584,7 @@ class GenericAgentHandler(BaseHandler):
                     )
                     return StepOutcome({}, next_prompt=next_prompt)
         #yield "[Info] Final response to user.\n"
+        self._empty_ct = 0
         return StepOutcome(response, next_prompt=None)
     
     def do_start_long_term_update(self, args, response):
